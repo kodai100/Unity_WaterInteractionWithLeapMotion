@@ -1,0 +1,186 @@
+﻿#pragma kernel DensityCS
+#pragma kernel ForceCS
+#pragma kernel IntegrateCS
+
+struct Particle {
+	float2 position;
+	float2 velocity;
+};
+
+struct ParticleForces {
+	float2 acceleration;
+};
+
+struct ParticleDensity {
+	float density;
+};
+
+cbuffer CB {
+	int   _NumParticles;
+	float _TimeStep;
+	float _Smoothlen;
+	float _PressureStiffness;
+	float _RestDensity;
+	float _DensityCoef;
+	float _GradPressureCoef;
+	float _LapViscosityCoef;
+	float _WallStiffness;
+	float2 _Gravity;
+	float2 _Range;
+	float3 _MousePos;
+	float _Radius;
+	bool _MouseDown;
+};
+
+#define SIMULATION_BLOCK_SIZE 1024
+
+//--------------------------------------------------------------------------------------
+// Structured Buffers
+//--------------------------------------------------------------------------------------
+StructuredBuffer  <Particle>        _ParticlesBufferRead;
+RWStructuredBuffer<Particle>        _ParticlesBufferWrite;
+
+StructuredBuffer  <ParticleDensity> _ParticlesDensityBufferRead;
+RWStructuredBuffer<ParticleDensity> _ParticlesDensityBufferWrite;
+
+StructuredBuffer  <ParticleForces>  _ParticlesForceBufferRead;
+RWStructuredBuffer<ParticleForces>  _ParticlesForceBufferWrite;
+
+//--------------------------------------------------------------------------------------
+// Density Calculation
+//--------------------------------------------------------------------------------------
+
+float CalculateDensity(float r_sq) {
+	const float h_sq = _Smoothlen * _Smoothlen;
+	// Implements this equation:
+	// W_poly6(r, h) = 315 / (64 * pi * h^9) * (h^2 - r^2)^3
+	// g_fDensityCoef = fParticleMass * 315.0f / (64.0f * PI * fSmoothlen^9)
+	return _DensityCoef * (h_sq - r_sq) * (h_sq - r_sq) * (h_sq - r_sq);
+}
+
+[numthreads(SIMULATION_BLOCK_SIZE, 1, 1)]
+void DensityCS(uint3 DTid : SV_DispatchThreadID) {
+	uint P_ID = DTid.x;
+
+	float h_sq = _Smoothlen * _Smoothlen;
+	float2 P_position = _ParticlesBufferRead[P_ID].position;
+
+	float density = 0;
+
+	for (uint N_ID = 0; N_ID < _NumParticles; N_ID++) {
+		if (N_ID == P_ID) continue;
+
+		float2 N_position = _ParticlesBufferRead[N_ID].position;
+
+		float2 diff = N_position - P_position;
+		float r_sq = dot(diff, diff);
+		if (r_sq < h_sq) {
+			density += CalculateDensity(r_sq);
+		}
+	}
+
+	_ParticlesDensityBufferWrite[P_ID].density = max(density, _RestDensity);	// max大事
+}
+
+float CalculatePressure(float density) {
+	// Implements this equation:
+	// Pressure = B * ((rho / rho_0)^y  - 1)
+	return _PressureStiffness * max(pow(density / _RestDensity, 3) - 1, 0);
+}
+
+float2 CalculateGradPressure(float r, float P_pressure, float N_pressure, float N_density, float2 diff) {
+	const float h = _Smoothlen;
+	float avg_pressure = 0.5f * (N_pressure + P_pressure);
+	// Implements this equation:
+	// W_spkiey(r, h) = 15 / (pi * h^6) * (h - r)^3
+	// GRAD( W_spikey(r, h) ) = -45 / (pi * h^6) * (h - r)^2
+	// g_fGradPressureCoef = fParticleMass * -45.0f / (PI * fSmoothlen^6)
+	return _GradPressureCoef * avg_pressure / N_density * (h - r) * (h - r) / r * (diff);
+}
+
+float2 CalculateLapVelocity(float r, float2 P_velocity, float2 N_velocity, float N_density) {
+	const float h = _Smoothlen;
+	float2 vel_diff = (N_velocity - P_velocity);
+	// Implements this equation:
+	// W_viscosity(r, h) = 15 / (2 * pi * h^3) * (-r^3 / (2 * h^3) + r^2 / h^2 + h / (2 * r) - 1)
+	// LAPLACIAN( W_viscosity(r, h) ) = 45 / (pi * h^6) * (h - r)
+	// g_fLapViscosityCoef = fParticleMass * fViscosity * 45.0f / (PI * fSmoothlen^6)
+	return _LapViscosityCoef / N_density * (h - r) * vel_diff;
+}
+
+[numthreads(SIMULATION_BLOCK_SIZE, 1, 1)]
+void ForceCS(uint3 DTid : SV_DispatchThreadID) {
+	uint P_ID = DTid.x; // Particle ID to operate on
+
+	float2 P_position = _ParticlesBufferRead[P_ID].position;
+	float2 P_velocity = _ParticlesBufferRead[P_ID].velocity;
+	float  P_density = _ParticlesDensityBufferRead[P_ID].density;
+	float  P_pressure = CalculatePressure(P_density);
+
+	const float h_sq = _Smoothlen * _Smoothlen;
+
+	float2 acceleration = float2(0, 0);
+
+	for (uint N_ID = 0; N_ID < _NumParticles; N_ID++) {
+		if (N_ID == P_ID) continue;
+
+		float2 N_position = _ParticlesBufferRead[N_ID].position;
+
+		float2 diff = N_position - P_position;
+		float r_sq = dot(diff, diff);
+		if (r_sq < h_sq) {
+			float2 N_velocity = _ParticlesBufferRead[N_ID].velocity;
+			float  N_density = _ParticlesDensityBufferRead[N_ID].density;
+			float  N_pressure = CalculatePressure(N_density);
+			float  r = sqrt(r_sq);
+
+			// Pressure Term
+			acceleration += CalculateGradPressure(r, P_pressure, N_pressure, N_density, diff);
+
+			// Viscosity Term
+			acceleration += CalculateLapVelocity(r, P_velocity, N_velocity, N_density);
+		}
+	}
+
+	_ParticlesForceBufferWrite[P_ID].acceleration = acceleration / P_density;
+}
+
+[numthreads(SIMULATION_BLOCK_SIZE, 1, 1)]
+void IntegrateCS(uint3 DTid : SV_DispatchThreadID) {
+	const unsigned int P_ID = DTid.x; // Particle ID to operate on
+
+	float2 position = _ParticlesBufferRead[P_ID].position;
+	float2 velocity = _ParticlesBufferRead[P_ID].velocity;
+	float2 acceleration = _ParticlesForceBufferRead[P_ID].acceleration;
+
+	float  _Restitution = 0.001;
+
+	if (distance(position, _MousePos.xy) < _Radius && _MouseDown) {
+		float2 dir = position - _MousePos.xy;
+		float pushBack = _Radius-length(dir);
+		acceleration += 100 * pushBack * normalize(dir);
+	}
+
+	float dist = dot(float3(position, 1), float3(1, 0, 0));
+	acceleration += min(dist, 0) * -_WallStiffness * float2(1, 0);
+
+	dist = dot(float3(position, 1), float3(0, 1, 0));
+	acceleration += min(dist, 0) * -_WallStiffness * float2(0, 1);
+
+	dist = dot(float3(position, 1), float3(-1, 0, _Range.x));
+	acceleration += min(dist, 0) * -_WallStiffness * float2(-1, 0);
+
+	dist = dot(float3(position, 1), float3(0, -1, _Range.y));
+	acceleration += min(dist, 0) * -_WallStiffness * float2(0, -1);
+
+	// Apply gravity
+	acceleration += _Gravity;
+
+	// Integrate
+	velocity += _TimeStep * acceleration;
+	position += _TimeStep * velocity;
+
+	// Update
+	_ParticlesBufferWrite[P_ID].position = position;
+	_ParticlesBufferWrite[P_ID].velocity = velocity;
+}
